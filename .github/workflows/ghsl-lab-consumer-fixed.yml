@@ -1,0 +1,337 @@
+name: GHSL Lab Consumer Fixed
+
+on:
+  workflow_run:
+    workflows:
+      - GHSL Lab Producer Fixed
+    types:
+      - completed
+
+# Keep the workflow-wide token read-only. Only the isolated sink job receives
+# contents: write; no PAT or local gh credential is ever exposed to a runner.
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ghsl-lab-consumer-fixed-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  consume-rebuilt-dist:
+    name: Validate GHSL provenance and apply the fixed write-back policy
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.name == 'GHSL Lab Producer Fixed' &&
+      github.repository_id == 1450391213 &&
+      github.event.workflow_run.head_repository.id == 1452320068 &&
+      github.event.workflow_run.pull_requests[0].number != null
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+
+    steps:
+      - name: Verify exact Producer Run, Fork, PR and Head SHA
+        id: identity
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const baseRepoId = 1450391213;
+            const forkRepoId = 1452320068;
+            const expectedWorkflowPath = ".github/workflows/ghsl-lab-producer-fixed.yml";
+            const eventRun = context.payload.workflow_run;
+            const runId = Number(eventRun.id);
+            const { owner, repo } = context.repo;
+
+            if (Number(context.payload.repository.id) !== baseRepoId) {
+              throw new Error("Consumer is not running in the authorized Base repository");
+            }
+
+            const runResponse = await github.rest.actions.getWorkflowRun({
+              owner,
+              repo,
+              run_id: runId
+            });
+            const run = runResponse.data;
+
+            if (Number(run.id) !== runId) throw new Error("Producer Run ID mismatch");
+            if (run.event !== "pull_request") throw new Error("Producer is not a pull_request run");
+            if (run.conclusion !== "success") throw new Error("Producer Run did not succeed");
+            if (run.name !== "GHSL Lab Producer Fixed") throw new Error("Unexpected Producer workflow name");
+            if (Number(run.repository?.id) !== baseRepoId) throw new Error("Producer Base repository ID mismatch");
+            if (Number(run.head_repository?.id) !== forkRepoId) throw new Error("Producer Fork repository ID mismatch");
+            if (run.head_repository?.full_name !== "dgm273970-fork/codeql-actions-gate") {
+              throw new Error("Producer Fork repository name mismatch");
+            }
+
+            const workflowResponse = await github.rest.actions.getWorkflow({
+              owner,
+              repo,
+              workflow_id: run.workflow_id
+            });
+            const workflow = workflowResponse.data;
+            if (workflow.path !== expectedWorkflowPath || workflow.name !== "GHSL Lab Producer Fixed") {
+              throw new Error("Producer workflow definition identity mismatch");
+            }
+
+            const eventPRs = eventRun.pull_requests || [];
+            const runPRs = run.pull_requests || [];
+            if (eventPRs.length !== 1 || runPRs.length !== 1) {
+              throw new Error("Expected exactly one PR association for the Producer Run");
+            }
+            const prNumber = Number(eventPRs[0].number);
+            if (!Number.isInteger(prNumber) || prNumber <= 0 || Number(runPRs[0].number) !== prNumber) {
+              throw new Error("Producer Run PR association mismatch");
+            }
+
+            const prResponse = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: prNumber
+            });
+            const pr = prResponse.data;
+            if (Number(pr.number) !== prNumber) throw new Error("GitHub PR number mismatch");
+            if (Number(pr.base?.repo?.id) !== baseRepoId) throw new Error("PR Base repository ID mismatch");
+            if (Number(pr.head?.repo?.id) !== forkRepoId) throw new Error("PR Head repository ID mismatch");
+            if (pr.base?.ref !== "main") throw new Error("PR Base branch is not main");
+            if (pr.head?.sha !== run.head_sha || run.head_sha !== eventRun.head_sha) {
+              throw new Error("PR Head SHA is not bound to the exact Producer Run");
+            }
+            if (pr.head?.ref !== run.head_branch) throw new Error("PR Head branch mismatch");
+
+            core.setOutput("pr-number", String(pr.number));
+            core.setOutput("head-sha", pr.head.sha);
+            core.info(JSON.stringify({
+              producer_run_id: run.id,
+              producer_workflow_id: run.workflow_id,
+              producer_workflow_path: workflow.path,
+              base_repository_id: run.repository.id,
+              fork_repository_id: run.head_repository.id,
+              pull_request_number: pr.number,
+              producer_head_sha: run.head_sha,
+              identity_checks: "PASS"
+            }));
+
+      - name: Download rebuilt-dist from the exact Producer Run
+        id: download
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rebuilt-dist
+          run-id: ${{ github.event.workflow_run.id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/ghsl-incoming
+
+      - name: Read and validate untrusted Artifact metadata
+        id: metadata
+        env:
+          EXPECTED_PR_NUMBER: ${{ steps.identity.outputs.pr-number }}
+          EXPECTED_HEAD_SHA: ${{ steps.identity.outputs.head-sha }}
+          EXPECTED_BASE_REPOSITORY_ID: "1450391213"
+          EXPECTED_HEAD_REPOSITORY_ID: "1452320068"
+          PRODUCER_RUN_ID: ${{ github.event.workflow_run.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          incoming="$RUNNER_TEMP/ghsl-incoming"
+          test -d "$incoming/dist"
+          test -f "$incoming/dist-meta/head-ref"
+          test -f "$incoming/dist-meta/head-sha"
+          test -f "$incoming/dist-meta/pr-number"
+          test -f "$incoming/dist-meta/metadata.json"
+
+          # These values are untrusted Artifact fields and remain the sources
+          # for the later checkout-independent Git Ref sink.
+          HEAD_REF="$(head -n1 "$incoming/dist-meta/head-ref" | tr -d '\r\n')"
+          HEAD_SHA="$(head -n1 "$incoming/dist-meta/head-sha" | tr -d '\r\n')"
+          PR_NUMBER="$(head -n1 "$incoming/dist-meta/pr-number" | tr -d '\r\n')"
+
+          if ! printf '%s' "$HEAD_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "Invalid Artifact head-sha" >&2
+            exit 1
+          fi
+          if [ "$PR_NUMBER" != "$EXPECTED_PR_NUMBER" ]; then
+            echo "Artifact PR number does not match the verified Producer Run PR" >&2
+            exit 1
+          fi
+          if [ "$HEAD_SHA" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "Artifact head-sha does not match the verified Producer Run Head SHA" >&2
+            exit 1
+          fi
+
+          # The target ref is still the untrusted Artifact field.  This is an
+          # experiment safety allowlist, not the missing GHSL source/target
+          # authorization binding: it does not force a single target value.
+          case "$HEAD_REF" in
+            lab-canary|ghsl-lab-*) ;;
+            *)
+              echo "Refusing target outside the authorized experiment refs: $HEAD_REF" >&2
+              exit 1
+              ;;
+          esac
+
+          python3 - "$incoming/dist-meta/metadata.json" "$HEAD_REF" "$HEAD_SHA" "$PR_NUMBER" "$PRODUCER_RUN_ID" "$EXPECTED_BASE_REPOSITORY_ID" "$EXPECTED_HEAD_REPOSITORY_ID" <<'PY'
+          import json
+          import sys
+
+          path, head_ref, head_sha, pr_number, producer_run_id, base_id, head_id = sys.argv[1:]
+          with open(path, encoding="utf-8") as handle:
+              metadata = json.load(handle)
+          expected = {
+              "schema_version": "1.0",
+              "experiment_id": "ghsl_2026_225_real_platform",
+              "variant": "fixed",
+              "producer_workflow": "GHSL Lab Producer Fixed",
+              "producer_run_id": int(producer_run_id),
+              "base_repository_id": int(base_id),
+              "head_repository_id": int(head_id),
+              "pr_number": int(pr_number),
+              "head_sha": head_sha,
+              "target_branch": "refs/heads/" + head_ref,
+          }
+          for key, value in expected.items():
+              if metadata.get(key) != value:
+                  raise SystemExit("Artifact metadata mismatch for %s: %r != %r" % (key, metadata.get(key), value))
+          print("GHSL_ARTIFACT_METADATA=MATCH")
+          PY
+
+          echo "head-ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
+          echo "head-sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "pr-number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce same-repository write-back policy
+        id: policy
+        env:
+          BASE_REPOSITORY_ID: "1450391213"
+          HEAD_REPOSITORY_ID: ${{ github.event.workflow_run.head_repository.id }}
+          PR_HEAD_REF: ${{ github.event.workflow_run.head_branch }}
+          TARGET_REF: refs/heads/${{ steps.metadata.outputs.head-ref }}
+          PRODUCER_RUN_ID: ${{ github.event.workflow_run.id }}
+          PR_NUMBER: ${{ steps.metadata.outputs.pr-number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/ghsl-fixed-evidence"
+          mkdir -p "$evidence"
+
+          decision=REJECT
+          reason="unclassified"
+          if [ "$HEAD_REPOSITORY_ID" = "$BASE_REPOSITORY_ID" ]; then
+            if [ "$TARGET_REF" = "refs/heads/$PR_HEAD_REF" ]; then
+              decision=ALLOW
+              reason="same-repository PR write-back to the PR head branch"
+            else
+              reason="target ref is not the PR head branch for the same-repository policy"
+            fi
+          else
+            reason="fork PR head repository has an empty authorized write-back set"
+          fi
+
+          python3 - "$evidence/decision.json" "$decision" "$reason" "$BASE_REPOSITORY_ID" "$HEAD_REPOSITORY_ID" "$PR_HEAD_REF" "$TARGET_REF" "$PRODUCER_RUN_ID" "$PR_NUMBER" <<'PY'
+          import json
+          import sys
+
+          path, decision, reason, base_id, head_id, pr_head_ref, target_ref, producer_run_id, pr_number = sys.argv[1:]
+          payload = {
+              "policy": "same_repository_pr_branch_write_back",
+              "decision": decision,
+              "reason": reason,
+              "base_repository_id": int(base_id),
+              "head_repository_id": int(head_id),
+              "pr_head_ref": pr_head_ref,
+              "target_ref": target_ref,
+              "producer_run_id": int(producer_run_id),
+              "pr_number": int(pr_number),
+              "sink_executed": False,
+          }
+          with open(path, "w", encoding="utf-8") as handle:
+              json.dump(payload, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          print(json.dumps(payload, sort_keys=True))
+          PY
+
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
+          echo "FIXED_POLICY_DECISION=$decision"
+
+      - name: Write the authorized same-repository ref (not reached for Fork PRs)
+        if: steps.policy.outputs.decision == 'ALLOW'
+        env:
+          PUSH_TOKEN: ${{ github.token }}
+          BASE_REPOSITORY: ${{ github.repository }}
+          HEAD_REF: ${{ steps.metadata.outputs.head-ref }}
+          HEAD_SHA: ${{ steps.metadata.outputs.head-sha }}
+          PR_NUMBER: ${{ steps.metadata.outputs.pr-number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          incoming="$RUNNER_TEMP/ghsl-incoming"
+
+          # Keep the Artifact head SHA as the parent of the new commit. The PR
+          # tree is read into Git's index only; no Fork PR code is checked out
+          # or executed. The downloaded dist/ bytes replace only dist/.
+          PR_HEAD_SHA="$HEAD_SHA"
+          workdir="$RUNNER_TEMP/ghsl-git-object-store"
+          index_file="$RUNNER_TEMP/ghsl-index"
+          mkdir -p "$workdir"
+          git init "$workdir"
+          export GIT_DIR="$workdir/.git"
+          export GIT_INDEX_FILE="$index_file"
+
+          git remote add fork "https://github.com/dgm273970-fork/codeql-actions-gate.git"
+          git remote add origin "https://github.com/$BASE_REPOSITORY.git"
+          git fetch --no-tags --depth=1 fork "$PR_HEAD_SHA"
+          git cat-file -e "$PR_HEAD_SHA^{commit}"
+          git read-tree "$PR_HEAD_SHA^{tree}"
+
+          # Use the downloaded Artifact as the worktree for the dist/ path only.
+          # Other files remain represented by the fetched commit tree in the index.
+          GIT_WORK_TREE="$incoming" git add -A -f -- dist/
+          tree_sha="$(git write-tree)"
+          new_commit="$(printf '%s\n' 'GHSL lab: apply rebuilt dist artifact' | \
+            git -c user.name='github-actions[bot]' \
+                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                commit-tree "$tree_sha" -p "$PR_HEAD_SHA")"
+
+          # The pushed source commit is derived from Artifact head-sha; the
+          # destination Ref is derived from Artifact head-ref. No force push.
+          HEAD_SHA="$new_commit"
+          cat > "$RUNNER_TEMP/ghsl-askpass.sh" <<'ASKPASS'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$PUSH_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          ASKPASS
+          chmod 700 "$RUNNER_TEMP/ghsl-askpass.sh"
+          export GIT_ASKPASS="$RUNNER_TEMP/ghsl-askpass.sh"
+          export GIT_TERMINAL_PROMPT=0
+
+          git push origin "$HEAD_SHA:refs/heads/$HEAD_REF"
+          remote_sha="$(git ls-remote origin "refs/heads/$HEAD_REF" | awk 'NR == 1 {print $1}')"
+          if [ "$remote_sha" != "$HEAD_SHA" ]; then
+            echo "Remote Ref SHA verification failed" >&2
+            exit 1
+          fi
+
+          echo "GHSL_REF_WRITE=SUCCESS"
+          echo "producer_run_id=${{ github.event.workflow_run.id }}"
+          echo "pull_request_number=$PR_NUMBER"
+          echo "artifact_head_sha=$PR_HEAD_SHA"
+          echo "consumer_commit_sha=$HEAD_SHA"
+          echo "written_ref=refs/heads/$HEAD_REF"
+          echo "verified_remote_ref_sha=$remote_sha"
+
+      - name: Upload fixed-path control evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghsl-fixed-control-evidence
+          path: ${{ runner.temp }}/ghsl-fixed-evidence
+          if-no-files-found: warn
+          retention-days: 7
