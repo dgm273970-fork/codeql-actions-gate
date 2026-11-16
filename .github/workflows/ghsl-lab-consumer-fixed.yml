@@ -25,9 +25,7 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.name == 'GHSL Lab Producer Fixed' &&
-      github.repository_id == 1450391213 &&
-      github.event.workflow_run.head_repository.id == 1452320068 &&
-      github.event.workflow_run.pull_requests[0].number != null
+      github.event.workflow_run.head_repository.id == 1452320068
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -48,8 +46,11 @@ jobs:
             const runId = Number(eventRun.id);
             const { owner, repo } = context.repo;
 
-            if (Number(context.payload.repository.id) !== baseRepoId) {
+            if (context.repo.owner !== "dgm273970-spec" || context.repo.repo !== "codeql-actions-gate") {
               throw new Error("Consumer is not running in the authorized Base repository");
+            }
+            if (context.payload.repository?.id && Number(context.payload.repository.id) !== baseRepoId) {
+              throw new Error("Consumer payload Base repository ID mismatch");
             }
 
             const runResponse = await github.rest.actions.getWorkflowRun({
@@ -81,11 +82,43 @@ jobs:
 
             const eventPRs = eventRun.pull_requests || [];
             const runPRs = run.pull_requests || [];
-            if (eventPRs.length !== 1 || runPRs.length !== 1) {
-              throw new Error("Expected exactly one PR association for the Producer Run");
+            const candidates = new Set();
+            for (const item of [...eventPRs, ...runPRs]) {
+              const number = Number(item?.number);
+              if (!Number.isInteger(number) || number <= 0) {
+                throw new Error("Invalid PR number in the Producer Run association");
+              }
+              candidates.add(number);
             }
-            const prNumber = Number(eventPRs[0].number);
-            if (!Number.isInteger(prNumber) || prNumber <= 0 || Number(runPRs[0].number) !== prNumber) {
+            let prNumber;
+            if (candidates.size > 1) {
+              throw new Error("Producer Run has conflicting PR associations");
+            }
+            if (candidates.size === 1) {
+              prNumber = [...candidates][0];
+            } else {
+              // GitHub may omit workflow_run.pull_requests for Fork PRs.  The
+              // Base repository's PR list is a trusted platform fallback; the
+              // untrusted Artifact is never used for this identity.
+              const headFullName = run.head_repository?.full_name;
+              const headBranch = run.head_branch;
+              if (!headFullName || !headBranch) {
+                throw new Error("Producer Run has no trusted Fork/head-branch identity");
+              }
+              const [headOwner, headRepo] = headFullName.split("/");
+              const listed = await github.rest.pulls.list({
+                owner,
+                repo,
+                head: `${headOwner}:${headBranch}`,
+                state: "all",
+                per_page: 100
+              });
+              if (listed.data.length !== 1) {
+                throw new Error("Expected exactly one trusted Base PR for the Producer head branch");
+              }
+              prNumber = Number(listed.data[0].number);
+            }
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
               throw new Error("Producer Run PR association mismatch");
             }
 
