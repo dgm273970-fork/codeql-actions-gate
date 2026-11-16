@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   consume-rebuilt-dist:
-    name: Validate GHSL provenance and write isolated lab-canary ref
+    name: Validate GHSL provenance and write the Artifact-selected experiment ref
     if: >
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'pull_request' &&
@@ -132,6 +132,9 @@ jobs:
         env:
           EXPECTED_PR_NUMBER: ${{ steps.identity.outputs.pr-number }}
           EXPECTED_HEAD_SHA: ${{ steps.identity.outputs.head-sha }}
+          EXPECTED_BASE_REPOSITORY_ID: "1450391213"
+          EXPECTED_HEAD_REPOSITORY_ID: "1452320068"
+          PRODUCER_RUN_ID: ${{ github.event.workflow_run.id }}
         shell: bash
         run: |
           set -euo pipefail
@@ -140,6 +143,7 @@ jobs:
           test -f "$incoming/dist-meta/head-ref"
           test -f "$incoming/dist-meta/head-sha"
           test -f "$incoming/dist-meta/pr-number"
+          test -f "$incoming/dist-meta/metadata.json"
 
           # These values are untrusted Artifact fields and remain the sources
           # for the later checkout-independent Git Ref sink.
@@ -147,10 +151,6 @@ jobs:
           HEAD_SHA="$(head -n1 "$incoming/dist-meta/head-sha" | tr -d '\r\n')"
           PR_NUMBER="$(head -n1 "$incoming/dist-meta/pr-number" | tr -d '\r\n')"
 
-          if [ "$HEAD_REF" != "lab-canary" ]; then
-            echo "Refusing Artifact head-ref outside lab-canary: $HEAD_REF" >&2
-            exit 1
-          fi
           if ! printf '%s' "$HEAD_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "Invalid Artifact head-sha" >&2
             exit 1
@@ -164,11 +164,47 @@ jobs:
             exit 1
           fi
 
+          # The target ref is still the untrusted Artifact field.  This is an
+          # experiment safety allowlist, not the missing GHSL source/target
+          # authorization binding: it does not force a single target value.
+          case "$HEAD_REF" in
+            lab-canary|ghsl-lab-*) ;;
+            *)
+              echo "Refusing target outside the authorized experiment refs: $HEAD_REF" >&2
+              exit 1
+              ;;
+          esac
+
+          python3 - "$incoming/dist-meta/metadata.json" "$HEAD_REF" "$HEAD_SHA" "$PR_NUMBER" "$PRODUCER_RUN_ID" "$EXPECTED_BASE_REPOSITORY_ID" "$EXPECTED_HEAD_REPOSITORY_ID" <<'PY'
+          import json
+          import sys
+
+          path, head_ref, head_sha, pr_number, producer_run_id, base_id, head_id = sys.argv[1:]
+          with open(path, encoding="utf-8") as handle:
+              metadata = json.load(handle)
+          expected = {
+              "schema_version": "1.0",
+              "experiment_id": "ghsl_2026_225_real_platform",
+              "variant": "vulnerable",
+              "producer_workflow": "GHSL Lab Producer",
+              "producer_run_id": int(producer_run_id),
+              "base_repository_id": int(base_id),
+              "head_repository_id": int(head_id),
+              "pr_number": int(pr_number),
+              "head_sha": head_sha,
+              "target_branch": "refs/heads/" + head_ref,
+          }
+          for key, value in expected.items():
+              if metadata.get(key) != value:
+                  raise SystemExit("Artifact metadata mismatch for %s: %r != %r" % (key, metadata.get(key), value))
+          print("GHSL_ARTIFACT_METADATA=MATCH")
+          PY
+
           echo "head-ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
           echo "head-sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
           echo "pr-number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
 
-      - name: Apply Artifact dist and write only the Artifact-selected lab-canary Ref
+      - name: Apply Artifact dist and write the Artifact-selected experiment Ref
         env:
           PUSH_TOKEN: ${{ github.token }}
           BASE_REPOSITORY: ${{ github.repository }}
