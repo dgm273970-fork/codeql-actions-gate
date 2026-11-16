@@ -87,7 +87,8 @@ jobs:
               handle.write("\n")
           print(json.dumps(metadata, sort_keys=True))
           PY
-          find dist dist-meta -type f -print -exec sha256sum {} \;
+          sha256sum dist/artifact.txt dist/head.txt dist-meta/head-ref dist-meta/head-sha dist-meta/pr-number dist-meta/metadata.json | tee dist-meta/SHA256SUMS
+          find dist dist-meta -type f -print
 
       - name: Upload rebuilt-dist
         uses: actions/upload-artifact@v4
