@@ -139,6 +139,12 @@ jobs:
 
             core.setOutput("pr-number", String(pr.number));
             core.setOutput("head-sha", pr.head.sha);
+            core.setOutput("head-branch", run.head_branch);
+            core.setOutput("base-ref", pr.base.ref);
+            core.setOutput("base-repository", run.repository.full_name);
+            core.setOutput("head-repository", run.head_repository.full_name);
+            core.setOutput("producer-run-attempt", String(run.run_attempt));
+            core.setOutput("producer-workflow", run.name);
             core.info(JSON.stringify({
               producer_run_id: run.id,
               producer_workflow_id: run.workflow_id,
@@ -147,6 +153,14 @@ jobs:
               fork_repository_id: run.head_repository.id,
               pull_request_number: pr.number,
               producer_head_sha: run.head_sha,
+              producer_run_attempt: run.run_attempt,
+              producer_workflow: run.name,
+              base_repository: run.repository.full_name,
+              head_repository: run.head_repository.full_name,
+              head_branch: run.head_branch,
+              base_ref: pr.base.ref,
+              consumer_run_id: process.env.GITHUB_RUN_ID,
+              consumer_job: process.env.GITHUB_JOB,
               identity_checks: "PASS"
             }));
 
@@ -167,7 +181,14 @@ jobs:
           EXPECTED_HEAD_SHA: ${{ steps.identity.outputs.head-sha }}
           EXPECTED_BASE_REPOSITORY_ID: "1450391213"
           EXPECTED_HEAD_REPOSITORY_ID: "1452320068"
+          EXPECTED_HEAD_BRANCH: ${{ steps.identity.outputs.head-branch }}
+          EXPECTED_BASE_REF: ${{ steps.identity.outputs.base-ref }}
+          EXPECTED_BASE_REPOSITORY: ${{ steps.identity.outputs.base-repository }}
+          EXPECTED_HEAD_REPOSITORY: ${{ steps.identity.outputs.head-repository }}
+          EXPECTED_PRODUCER_RUN_ATTEMPT: ${{ steps.identity.outputs.producer-run-attempt }}
+          EXPECTED_PRODUCER_WORKFLOW: ${{ steps.identity.outputs.producer-workflow }}
           PRODUCER_RUN_ID: ${{ github.event.workflow_run.id }}
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -177,6 +198,9 @@ jobs:
           test -f "$incoming/dist-meta/head-sha"
           test -f "$incoming/dist-meta/pr-number"
           test -f "$incoming/dist-meta/metadata.json"
+          test -f "$incoming/dist-meta/SHA256SUMS"
+          ( cd "$incoming" && sha256sum -c dist-meta/SHA256SUMS )
+          echo "GHSL_ARTIFACT_SHA256=MATCH"
 
           # These values are untrusted Artifact fields and remain the sources
           # for the later checkout-independent Git Ref sink.
@@ -208,11 +232,13 @@ jobs:
               ;;
           esac
 
-          python3 - "$incoming/dist-meta/metadata.json" "$HEAD_REF" "$HEAD_SHA" "$PR_NUMBER" "$PRODUCER_RUN_ID" "$EXPECTED_BASE_REPOSITORY_ID" "$EXPECTED_HEAD_REPOSITORY_ID" <<'PY'
+          python3 - "$incoming/dist-meta/metadata.json" "$HEAD_REF" "$HEAD_SHA" "$PR_NUMBER" "$PRODUCER_RUN_ID" "$EXPECTED_BASE_REPOSITORY_ID" "$EXPECTED_HEAD_REPOSITORY_ID" "$EXPECTED_HEAD_BRANCH" "$EXPECTED_BASE_REF" "$EXPECTED_BASE_REPOSITORY" "$EXPECTED_HEAD_REPOSITORY" "$EXPECTED_PRODUCER_RUN_ATTEMPT" "$EXPECTED_PRODUCER_WORKFLOW" <<'PY'
           import json
           import sys
 
-          path, head_ref, head_sha, pr_number, producer_run_id, base_id, head_id = sys.argv[1:]
+          (path, head_ref, head_sha, pr_number, producer_run_id, base_id, head_id,
+           head_branch, base_ref, base_repository, head_repository,
+           producer_run_attempt, producer_workflow) = sys.argv[1:]
           with open(path, encoding="utf-8") as handle:
               metadata = json.load(handle)
           expected = {
@@ -221,10 +247,15 @@ jobs:
               "variant": "fixed",
               "producer_workflow": "GHSL Lab Producer Fixed",
               "producer_run_id": int(producer_run_id),
+              "producer_run_attempt": int(producer_run_attempt),
+              "base_repository": base_repository,
               "base_repository_id": int(base_id),
+              "base_ref": base_ref,
+              "head_repository": head_repository,
               "head_repository_id": int(head_id),
-              "pr_number": int(pr_number),
+              "head_branch": head_branch,
               "head_sha": head_sha,
+              "pr_number": int(pr_number),
               "target_branch": "refs/heads/" + head_ref,
           }
           for key, value in expected.items():
@@ -232,6 +263,15 @@ jobs:
                   raise SystemExit("Artifact metadata mismatch for %s: %r != %r" % (key, metadata.get(key), value))
           print("GHSL_ARTIFACT_METADATA=MATCH")
           PY
+
+          ARTIFACTS_JSON="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PRODUCER_RUN_ID/artifacts?per_page=100")"
+          ARTIFACT_ID="$(printf '%s' "$ARTIFACTS_JSON" | jq -r '[.artifacts[] | select(.name == "rebuilt-dist" and .expired == false) | .id] | if length == 1 then .[0] else empty end')"
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "Expected exactly one live rebuilt-dist Artifact for the Producer Run" >&2
+            exit 1
+          fi
+          echo "artifact-id=$ARTIFACT_ID" >> "$GITHUB_OUTPUT"
+          echo "GHSL_ARTIFACT_ID=$ARTIFACT_ID"
 
           echo "head-ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
           echo "head-sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
@@ -246,6 +286,9 @@ jobs:
           TARGET_REF: refs/heads/${{ steps.metadata.outputs.head-ref }}
           PRODUCER_RUN_ID: ${{ github.event.workflow_run.id }}
           PR_NUMBER: ${{ steps.metadata.outputs.pr-number }}
+          CONSUMER_RUN_ID: ${{ github.run_id }}
+          CONSUMER_JOB_ID: ${{ job.check_run_id }}
+          ARTIFACT_ID: ${{ steps.metadata.outputs.artifact-id }}
         shell: bash
         run: |
           set -euo pipefail
@@ -265,11 +308,12 @@ jobs:
             reason="fork PR head repository has an empty authorized write-back set"
           fi
 
-          python3 - "$evidence/decision.json" "$decision" "$reason" "$BASE_REPOSITORY_ID" "$HEAD_REPOSITORY_ID" "$PR_HEAD_REF" "$TARGET_REF" "$PRODUCER_RUN_ID" "$PR_NUMBER" <<'PY'
+          python3 - "$evidence/decision.json" "$decision" "$reason" "$BASE_REPOSITORY_ID" "$HEAD_REPOSITORY_ID" "$PR_HEAD_REF" "$TARGET_REF" "$PRODUCER_RUN_ID" "$PR_NUMBER" "$CONSUMER_RUN_ID" "$CONSUMER_JOB_ID" "$ARTIFACT_ID" <<'PY'
           import json
           import sys
 
-          path, decision, reason, base_id, head_id, pr_head_ref, target_ref, producer_run_id, pr_number = sys.argv[1:]
+          (path, decision, reason, base_id, head_id, pr_head_ref, target_ref,
+           producer_run_id, pr_number, consumer_run_id, consumer_job_id, artifact_id) = sys.argv[1:]
           payload = {
               "policy": "same_repository_pr_branch_write_back",
               "decision": decision,
@@ -280,6 +324,10 @@ jobs:
               "target_ref": target_ref,
               "producer_run_id": int(producer_run_id),
               "pr_number": int(pr_number),
+              "consumer_run_id": int(consumer_run_id),
+              "consumer_job_id": int(consumer_job_id),
+              "artifact_id": int(artifact_id),
+              "sink_permissions": "contents:write",
               "sink_executed": False,
           }
           with open(path, "w", encoding="utf-8") as handle:
@@ -296,6 +344,8 @@ jobs:
         env:
           PUSH_TOKEN: ${{ github.token }}
           BASE_REPOSITORY: ${{ github.repository }}
+          ARTIFACT_ID: ${{ steps.metadata.outputs.artifact-id }}
+          CONSUMER_JOB_ID: ${{ job.check_run_id }}
           HEAD_REF: ${{ steps.metadata.outputs.head-ref }}
           HEAD_SHA: ${{ steps.metadata.outputs.head-sha }}
           PR_NUMBER: ${{ steps.metadata.outputs.pr-number }}
@@ -353,6 +403,10 @@ jobs:
           fi
 
           echo "GHSL_REF_WRITE=SUCCESS"
+          echo "GHSL_SINK_PERMISSIONS=contents:write"
+          echo "GHSL_CONSUMER_RUN_ID=${{ github.run_id }}"
+          echo "GHSL_CONSUMER_JOB_ID=$CONSUMER_JOB_ID"
+          echo "GHSL_ARTIFACT_ID=$ARTIFACT_ID"
           echo "producer_run_id=${{ github.event.workflow_run.id }}"
           echo "pull_request_number=$PR_NUMBER"
           echo "artifact_head_sha=$PR_HEAD_SHA"
