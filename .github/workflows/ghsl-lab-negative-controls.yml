@@ -1,0 +1,241 @@
+name: GHSL Lab Negative Controls
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: Real Producer Run ID holding rebuilt-dist
+        required: true
+        default: "43874406125"
+      artifact_id:
+        description: Real rebuilt-dist Artifact ID
+        required: true
+        default: "14230405315"
+      artifact_target_ref:
+        description: Artifact target branch value
+        required: true
+        default: refs/heads/ghsl-lab-vuln-43874406125
+      artifact_head_sha:
+        description: Artifact head SHA
+        required: true
+        default: 4609d2194137d93c0eb46490a88add798fd53fb2
+      artifact_head_repository_id:
+        description: Artifact self-reported head repository ID
+        required: true
+        default: "1452320068"
+      artifact_base_repository_id:
+        description: Trusted Base repository ID
+        required: true
+        default: "1450391213"
+      artifact_pr_number:
+        description: Artifact PR number
+        required: true
+        default: "4"
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  field-log-only:
+    name: "Negative: Artifact field only logged"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download the real Artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rebuilt-dist
+          run-id: ${{ inputs.artifact_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/incoming
+      - name: Log target without a Ref Sink
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$(head -n1 "$RUNNER_TEMP/incoming/dist-meta/head-ref" | tr -d '\r\n')"
+          echo "NEGATIVE_CONTROL=field-log-only"
+          echo "ARTIFACT_TARGET_REF=refs/heads/$target"
+          echo "SINK_EXECUTED=false"
+
+  no-contents-write:
+    name: "Negative: Consumer has no contents: write"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Download the real Artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rebuilt-dist
+          run-id: ${{ inputs.artifact_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/incoming
+      - name: Attempt the Ref write with a read-only token
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ inputs.artifact_head_sha }}
+        run: |
+          set -euo pipefail
+          target="refs/heads/ghsl-lab-neg-no-write-${{ github.run_id }}"
+          echo "NEGATIVE_CONTROL=no-contents-write"
+          echo "ATTEMPTED_TARGET=$target"
+          set +e
+          response="$(gh api -i -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="$target" -f sha="$HEAD_SHA" 2>&1)"
+          rc=$?
+          set -e
+          echo "$response"
+          echo "WRITE_ATTEMPT_RC=$rc"
+          test "$rc" -ne 0
+          printf '%s' "$response" | grep -q '403'
+          echo "SINK_EXECUTED=false_WRITE_DENIED"
+
+  wrong-run-artifact:
+    name: "Negative: wrong Producer Run or Artifact"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Attempt to download from run 1
+        id: wrong-download
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rebuilt-dist
+          run-id: 1
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/wrong-incoming
+      - name: Require the wrong download to fail
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "NEGATIVE_CONTROL=wrong-run-artifact"
+          echo "DOWNLOAD_OUTCOME=${{ steps.wrong-download.outcome }}"
+          test "${{ steps.wrong-download.outcome }}" = "failure"
+          echo "SINK_EXECUTED=false"
+
+  head-repository-mismatch:
+    name: "Negative: trusted head repository mismatch"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download the real Artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rebuilt-dist
+          run-id: ${{ inputs.artifact_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/incoming
+      - name: Reject when the trusted Base ID is compared to the Artifact Fork ID
+        shell: bash
+        env:
+          ARTIFACT_HEAD_ID: ${{ inputs.artifact_head_repository_id }}
+          TRUSTED_BASE_ID: ${{ inputs.artifact_base_repository_id }}
+        run: |
+          set -euo pipefail
+          echo "NEGATIVE_CONTROL=head-repository-mismatch"
+          echo "TRUSTED_BASE_ID=$TRUSTED_BASE_ID"
+          echo "ARTIFACT_HEAD_ID=$ARTIFACT_HEAD_ID"
+          if [ "$ARTIFACT_HEAD_ID" = "$TRUSTED_BASE_ID" ]; then
+            echo "Unexpected match" >&2
+            exit 1
+          fi
+          echo "GHSL_BINDING=REJECT"
+          echo "SINK_EXECUTED=false"
+
+  head-sha-mismatch:
+    name: "Negative: trusted head SHA mismatch"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download the real Artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rebuilt-dist
+          run-id: ${{ inputs.artifact_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/incoming
+      - name: Reject when the Artifact SHA differs from the trusted SHA
+        shell: bash
+        env:
+          ARTIFACT_HEAD_SHA: ${{ inputs.artifact_head_sha }}
+        run: |
+          set -euo pipefail
+          trusted_head_sha="0000000000000000000000000000000000000000"
+          echo "NEGATIVE_CONTROL=head-sha-mismatch"
+          echo "TRUSTED_HEAD_SHA=$trusted_head_sha"
+          echo "ARTIFACT_HEAD_SHA=$ARTIFACT_HEAD_SHA"
+          if [ "$ARTIFACT_HEAD_SHA" = "$trusted_head_sha" ]; then
+            echo "Unexpected match" >&2
+            exit 1
+          fi
+          echo "GHSL_BINDING=REJECT"
+          echo "SINK_EXECUTED=false"
+
+  target-ref-not-allowed:
+    name: "Negative: target Ref outside the policy"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download the real Artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rebuilt-dist
+          run-id: ${{ inputs.artifact_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/incoming
+      - name: Reject the Artifact target against the declared target policy
+        shell: bash
+        env:
+          ARTIFACT_TARGET_REF: ${{ inputs.artifact_target_ref }}
+        run: |
+          set -euo pipefail
+          echo "NEGATIVE_CONTROL=target-ref-not-allowed"
+          echo "ARTIFACT_TARGET_REF=$ARTIFACT_TARGET_REF"
+          case "$ARTIFACT_TARGET_REF" in
+            refs/heads/lab-canary) echo "GHSL_TARGET_POLICY=ALLOW" ;;
+            *)
+              echo "GHSL_TARGET_POLICY=REJECT"
+              echo "SINK_EXECUTED=false"
+              exit 0
+              ;;
+          esac
+          echo "Unexpectedly allowed" >&2
+          exit 1
+
+  producer-fork-no-authorization:
+    name: "Negative: Fork Producer has no write authorization"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download the real Artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rebuilt-dist
+          run-id: ${{ inputs.artifact_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/incoming
+      - name: Reject the Fork Producer under the same-repository policy
+        shell: bash
+        env:
+          ARTIFACT_HEAD_ID: ${{ inputs.artifact_head_repository_id }}
+          TRUSTED_BASE_ID: ${{ inputs.artifact_base_repository_id }}
+        run: |
+          set -euo pipefail
+          echo "NEGATIVE_CONTROL=producer-fork-no-authorization"
+          if [ "$ARTIFACT_HEAD_ID" = "$TRUSTED_BASE_ID" ]; then
+            echo "Unexpected same-repository identity" >&2
+            exit 1
+          fi
+          echo "GHSL_WRITE_BACK_POLICY=EMPTY_SET"
+          echo "SINK_EXECUTED=false"
