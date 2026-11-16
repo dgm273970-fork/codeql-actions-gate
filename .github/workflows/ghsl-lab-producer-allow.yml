@@ -1,0 +1,122 @@
+name: GHSL Lab Producer Allow
+
+# Guide Phase 7 item 8 — legitimate-authorization positive control.
+#
+# The fixed path (§9.2) proves that a Fork PR input is rejected because the
+# Same-Repository PR Branch Write-Back Policy gives it an empty authorized set.
+# That alone cannot be presented as "the fix is correct": §5.5 also declares an
+# ALLOW case, and item 8 requires a real run of exactly that case.
+#
+# This Producer runs only for a same-repository PR (head repo id == base repo
+# id), and puts the PR head branch into the Artifact the same way the
+# vulnerable Producer does, so the Artifact field -> Consumer -> Ref Sink data
+# flow is unchanged.  The difference is the value: here it is the one target
+# the declared policy authorizes.
+#
+# `types: [opened]` only: the authorized write-back advances the PR head branch,
+# and a `synchronize` trigger would re-enter the chain.  Opening-only keeps this
+# control to exactly one real write.
+on:
+  pull_request:
+    types:
+      - opened
+    branches:
+      - main
+    paths:
+      - ghsl-lab/allow-input/**
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  produce:
+    name: Produce rebuilt-dist for the authorized write-back control
+    if: >
+      github.repository == 'dgm273970-spec/codeql-actions-gate' &&
+      github.event.pull_request.head.repo.id == github.event.pull_request.base.repo.id
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Create controlled artifact metadata
+        shell: bash
+        env:
+          BASE_REPOSITORY_ID: ${{ github.event.pull_request.base.repo.id }}
+          BASE_REPOSITORY: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.id }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PRODUCER_RUN_ID: ${{ github.run_id }}
+          PRODUCER_RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER_WORKFLOW: GHSL Lab Producer Allow
+          TARGET_REF: refs/heads/${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist dist-meta
+          printf 'GHSL lab ALLOW control artifact from PR %s\n' "$PR_NUMBER" > dist/artifact.txt
+          printf '%s\n' "$PR_HEAD_SHA" > dist/head.txt
+          TARGET_BRANCH="${TARGET_REF#refs/heads/}"
+          printf '%s\n' "$TARGET_BRANCH" > dist-meta/head-ref
+          printf '%s\n' "$PR_HEAD_SHA" > dist-meta/head-sha
+          printf '%s\n' "$PR_NUMBER" > dist-meta/pr-number
+          python3 - <<'PY'
+          import json
+          import os
+
+          metadata = {
+              "schema_version": "1.0",
+              "experiment_id": "ghsl_2026_225_real_platform",
+              "variant": "allow_control",
+              "producer_workflow": os.environ["PRODUCER_WORKFLOW"],
+              "producer_run_id": int(os.environ["PRODUCER_RUN_ID"]),
+              "producer_run_attempt": int(os.environ["PRODUCER_RUN_ATTEMPT"]),
+              "base_repository": os.environ["BASE_REPOSITORY"],
+              "base_repository_id": int(os.environ["BASE_REPOSITORY_ID"]),
+              "base_ref": os.environ["BASE_REF"],
+              "base_sha": os.environ["BASE_SHA"],
+              "head_repository": os.environ["HEAD_REPOSITORY"],
+              "head_repository_id": int(os.environ["HEAD_REPOSITORY_ID"]),
+              "head_branch": os.environ["PR_HEAD_REF"],
+              "head_sha": os.environ["PR_HEAD_SHA"],
+              "pr_number": int(os.environ["PR_NUMBER"]),
+              "target_branch": os.environ["TARGET_REF"],
+              "source_classification": {
+                  "schema_version": "experiment_controlled",
+                  "experiment_id": "experiment_controlled",
+                  "variant": "experiment_controlled",
+                  "producer_workflow": "platform_trusted",
+                  "producer_run_id": "platform_trusted",
+                  "producer_run_attempt": "platform_trusted",
+                  "base_repository": "platform_trusted",
+                  "base_repository_id": "platform_trusted",
+                  "base_ref": "platform_trusted",
+                  "base_sha": "platform_trusted",
+                  "head_repository": "platform_trusted",
+                  "head_repository_id": "platform_trusted",
+                  "head_branch": "platform_trusted",
+                  "head_sha": "platform_trusted",
+                  "pr_number": "platform_trusted",
+                  "target_branch": "platform_trusted_same_repo_pr_head_ref"
+              }
+          }
+          with open("dist-meta/metadata.json", "w", encoding="utf-8") as handle:
+              json.dump(metadata, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          print(json.dumps(metadata, sort_keys=True))
+          PY
+          sha256sum dist/artifact.txt dist/head.txt dist-meta/head-ref dist-meta/head-sha dist-meta/pr-number dist-meta/metadata.json | tee dist-meta/SHA256SUMS
+          find dist dist-meta -type f -print
+
+      - name: Upload rebuilt-dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: rebuilt-dist
+          path: |
+            dist
+            dist-meta
+          if-no-files-found: error
+          retention-days: 7
