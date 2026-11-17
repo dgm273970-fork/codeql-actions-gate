@@ -188,7 +188,7 @@ jobs:
           EXPECTED_PR_NUMBER: ${{ steps.identity.outputs.pr-number }}
           EXPECTED_HEAD_SHA: ${{ steps.identity.outputs.head-sha }}
           EXPECTED_BASE_REPOSITORY_ID: "1450391213"
-          EXPECTED_HEAD_REPOSITORY_ID: "1452320068"
+          EXPECTED_HEAD_REPOSITORY_ID: ${{ steps.identity.outputs.head-repository-id }}
           EXPECTED_HEAD_BRANCH: ${{ steps.identity.outputs.head-branch }}
           EXPECTED_BASE_REF: ${{ steps.identity.outputs.base-ref }}
           EXPECTED_BASE_REPOSITORY: ${{ steps.identity.outputs.base-repository }}
