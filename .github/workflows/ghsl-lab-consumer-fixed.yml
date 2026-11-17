@@ -233,7 +233,7 @@ jobs:
           # experiment safety allowlist, not the missing GHSL source/target
           # authorization binding: it does not force a single target value.
           case "$HEAD_REF" in
-            lab-canary|ghsl-lab-*) ;;
+            lab-canary|ghsl-lab-*|"$EXPECTED_HEAD_BRANCH") ;;
             *)
               echo "Refusing target outside the authorized experiment refs: $HEAD_REF" >&2
               exit 1
