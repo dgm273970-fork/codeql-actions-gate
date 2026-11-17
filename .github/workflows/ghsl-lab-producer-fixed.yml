@@ -32,7 +32,7 @@ jobs:
           PRODUCER_RUN_ID: ${{ github.run_id }}
           PRODUCER_RUN_ATTEMPT: ${{ github.run_attempt }}
           PRODUCER_WORKFLOW: GHSL Lab Producer Fixed
-          TARGET_REF: refs/heads/ghsl-lab-fixed-${{ github.run_id }}
+          TARGET_REF: refs/heads/${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
           mkdir -p dist dist-meta
@@ -79,7 +79,7 @@ jobs:
                   "head_branch": "platform_trusted",
                   "head_sha": "platform_trusted",
                   "pr_number": "platform_trusted",
-                  "target_branch": "experiment_controlled"
+                  "target_branch": "platform_trusted"
               }
           }
           with open("dist-meta/metadata.json", "w", encoding="utf-8") as handle:

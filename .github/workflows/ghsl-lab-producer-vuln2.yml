@@ -1,0 +1,123 @@
+name: GHSL Lab Producer Vuln2
+
+# P0-1 attacker-controlled target: the PR author edits a data-only input file
+# under ghsl-lab/vuln2/. The Producer reads that file and uses it as the Ref
+# suffix. The workflow definition itself need not be modified by the PR.
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ghsl-lab/vuln2/**
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  produce:
+    name: Produce rebuilt-dist with PR-chosen ref suffix
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Read PR-controlled suffix (data only; no PR code executed)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Create controlled artifact metadata
+        shell: bash
+        env:
+          BASE_REPOSITORY_ID: ${{ github.event.pull_request.base.repo.id }}
+          BASE_REPOSITORY: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.id }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PRODUCER_RUN_ID: ${{ github.run_id }}
+          PRODUCER_RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER_WORKFLOW: GHSL Lab Producer Vuln2
+        run: |
+          set -euo pipefail
+          mkdir -p dist dist-meta
+          test -f ghsl-lab/vuln2/suffix.txt
+          SUFFIX="$(head -n1 ghsl-lab/vuln2/suffix.txt | tr -cd 'A-Za-z0-9._-')"
+          if [ -z "$SUFFIX" ] || [ "${#SUFFIX}" -gt 40 ]; then
+            echo "Invalid PR-controlled suffix" >&2
+            exit 1
+          fi
+          TARGET_REF="refs/heads/ghsl-lab-vuln2-${SUFFIX}-${PRODUCER_RUN_ID}"
+          TARGET_BRANCH="${TARGET_REF#refs/heads/}"
+          printf 'PR-chosen suffix: %s\n' "$SUFFIX" > dist/artifact.txt
+          printf '%s\n' "$PR_HEAD_SHA" > dist/head.txt
+          printf '%s\n' "$TARGET_BRANCH" > dist-meta/head-ref
+          printf '%s\n' "$PR_HEAD_SHA" > dist-meta/head-sha
+          printf '%s\n' "$PR_NUMBER" > dist-meta/pr-number
+          python3 - "$SUFFIX" "$TARGET_REF" <<'PY'
+          import json
+          import os
+          import sys
+
+          suffix, target_ref = sys.argv[1:]
+          metadata = {
+              "schema_version": "1.0",
+              "experiment_id": "ghsl_2026_225_real_platform",
+              "variant": "vulnerable2",
+              "producer_workflow": os.environ["PRODUCER_WORKFLOW"],
+              "producer_run_id": int(os.environ["PRODUCER_RUN_ID"]),
+              "producer_run_attempt": int(os.environ["PRODUCER_RUN_ATTEMPT"]),
+              "base_repository": os.environ["BASE_REPOSITORY"],
+              "base_repository_id": int(os.environ["BASE_REPOSITORY_ID"]),
+              "base_ref": os.environ["BASE_REF"],
+              "base_sha": os.environ["BASE_SHA"],
+              "head_repository": os.environ["HEAD_REPOSITORY"],
+              "head_repository_id": int(os.environ["HEAD_REPOSITORY_ID"]),
+              "head_branch": os.environ["PR_HEAD_REF"],
+              "head_sha": os.environ["PR_HEAD_SHA"],
+              "pr_number": int(os.environ["PR_NUMBER"]),
+              "target_branch": target_ref,
+              "target_input_suffix": suffix,
+              "target_source": "attacker_pr_file:ghsl-lab/vuln2/suffix.txt",
+              "source_classification": {
+                  "schema_version": "experiment_controlled",
+                  "experiment_id": "experiment_controlled",
+                  "variant": "experiment_controlled",
+                  "producer_workflow": "platform_trusted",
+                  "producer_run_id": "platform_trusted",
+                  "producer_run_attempt": "platform_trusted",
+                  "base_repository": "platform_trusted",
+                  "base_repository_id": "platform_trusted",
+                  "base_ref": "platform_trusted",
+                  "base_sha": "platform_trusted",
+                  "head_repository": "platform_trusted",
+                  "head_repository_id": "platform_trusted",
+                  "head_branch": "platform_trusted",
+                  "head_sha": "platform_trusted",
+                  "pr_number": "platform_trusted",
+                  "target_branch": "attacker_controlled",
+                  "target_input_suffix": "attacker_controlled",
+                  "target_source": "experiment_controlled"
+              }
+          }
+          with open("dist-meta/metadata.json", "w", encoding="utf-8") as handle:
+              json.dump(metadata, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          print(json.dumps(metadata, sort_keys=True))
+          PY
+          sha256sum dist/artifact.txt dist/head.txt dist-meta/head-ref dist-meta/head-sha dist-meta/pr-number dist-meta/metadata.json | tee dist-meta/SHA256SUMS
+          find dist dist-meta -type f -print
+
+      - name: Upload rebuilt-dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: rebuilt-dist
+          path: |
+            dist
+            dist-meta
+          if-no-files-found: error
+          retention-days: 7

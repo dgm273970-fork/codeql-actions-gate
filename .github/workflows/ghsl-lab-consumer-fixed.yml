@@ -25,7 +25,8 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.name == 'GHSL Lab Producer Fixed' &&
-      github.event.workflow_run.head_repository.id == 1452320068
+      (github.event.workflow_run.head_repository.id == 1450391213 ||
+       github.event.workflow_run.head_repository.id == 1452320068)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -65,9 +66,15 @@ jobs:
             if (run.conclusion !== "success") throw new Error("Producer Run did not succeed");
             if (run.name !== "GHSL Lab Producer Fixed") throw new Error("Unexpected Producer workflow name");
             if (Number(run.repository?.id) !== baseRepoId) throw new Error("Producer Base repository ID mismatch");
-            if (Number(run.head_repository?.id) !== forkRepoId) throw new Error("Producer Fork repository ID mismatch");
-            if (run.head_repository?.full_name !== "dgm273970-fork/codeql-actions-gate") {
-              throw new Error("Producer Fork repository name mismatch");
+            const headRepoId = Number(run.head_repository?.id);
+            if (headRepoId !== baseRepoId && headRepoId !== forkRepoId) {
+              throw new Error("Producer head repository is neither the Base nor the authorized Fork");
+            }
+            const expectedHeadFullName = headRepoId === baseRepoId
+              ? run.repository.full_name
+              : "dgm273970-fork/codeql-actions-gate";
+            if (run.head_repository?.full_name !== expectedHeadFullName) {
+              throw new Error("Producer head repository name mismatch");
             }
 
             const workflowResponse = await github.rest.actions.getWorkflow({
@@ -130,7 +137,7 @@ jobs:
             const pr = prResponse.data;
             if (Number(pr.number) !== prNumber) throw new Error("GitHub PR number mismatch");
             if (Number(pr.base?.repo?.id) !== baseRepoId) throw new Error("PR Base repository ID mismatch");
-            if (Number(pr.head?.repo?.id) !== forkRepoId) throw new Error("PR Head repository ID mismatch");
+            if (Number(pr.head?.repo?.id) !== headRepoId) throw new Error("PR Head repository ID mismatch");
             if (pr.base?.ref !== "main") throw new Error("PR Base branch is not main");
             if (pr.head?.sha !== run.head_sha || run.head_sha !== eventRun.head_sha) {
               throw new Error("PR Head SHA is not bound to the exact Producer Run");
@@ -143,6 +150,7 @@ jobs:
             core.setOutput("base-ref", pr.base.ref);
             core.setOutput("base-repository", run.repository.full_name);
             core.setOutput("head-repository", run.head_repository.full_name);
+            core.setOutput("head-repository-id", String(headRepoId));
             core.setOutput("producer-run-attempt", String(run.run_attempt));
             core.setOutput("producer-workflow", run.name);
             core.info(JSON.stringify({
@@ -348,6 +356,7 @@ jobs:
           CONSUMER_JOB_ID: ${{ job.check_run_id }}
           HEAD_REF: ${{ steps.metadata.outputs.head-ref }}
           HEAD_SHA: ${{ steps.metadata.outputs.head-sha }}
+          HEAD_REPOSITORY_ID: ${{ github.event.workflow_run.head_repository.id }}
           PR_NUMBER: ${{ steps.metadata.outputs.pr-number }}
         shell: bash
         run: |
@@ -365,9 +374,15 @@ jobs:
           export GIT_DIR="$workdir/.git"
           export GIT_INDEX_FILE="$index_file"
 
-          git remote add fork "https://github.com/dgm273970-fork/codeql-actions-gate.git"
           git remote add origin "https://github.com/$BASE_REPOSITORY.git"
-          git fetch --no-tags --depth=1 fork "$PR_HEAD_SHA"
+          if [ "$HEAD_REPOSITORY_ID" = "1450391213" ]; then
+            # Same-repository PR: the head commit is in the Base repository.
+            git remote add source "https://github.com/$BASE_REPOSITORY.git"
+          else
+            # Fork PR: reachable here only if a future policy change allows it.
+            git remote add source "https://github.com/dgm273970-fork/codeql-actions-gate.git"
+          fi
+          git fetch --no-tags --depth=1 source "$PR_HEAD_SHA"
           git cat-file -e "$PR_HEAD_SHA^{commit}"
           git read-tree "$PR_HEAD_SHA^{tree}"
 
