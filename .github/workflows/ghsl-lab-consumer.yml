@@ -291,10 +291,13 @@ jobs:
           set -euo pipefail
           incoming="$RUNNER_TEMP/ghsl-incoming"
 
-          # Keep the Artifact head SHA as the parent of the new commit. The PR
-          # tree is read into Git's index only; no Fork PR code is checked out
-          # or executed. The downloaded dist/ bytes replace only dist/.
+          # The Artifact-selected Ref is the experimental sink. Build its commit
+          # from the trusted Consumer Base commit, changing only dist/ from the
+          # exact Producer Artifact. The PR workflow definition remains confined
+          # to its Fork branch; a job token with contents:write cannot push a
+          # workflow-file modification into the Base repository.
           PR_HEAD_SHA="$HEAD_SHA"
+          BASE_SHA="${{ github.sha }}"
           workdir="$RUNNER_TEMP/ghsl-git-object-store"
           index_file="$RUNNER_TEMP/ghsl-index"
           mkdir -p "$workdir"
@@ -306,19 +309,22 @@ jobs:
           git remote add origin "https://github.com/$BASE_REPOSITORY.git"
           git fetch --no-tags --depth=1 fork "$PR_HEAD_SHA"
           git cat-file -e "$PR_HEAD_SHA^{commit}"
-          git read-tree "$PR_HEAD_SHA^{tree}"
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          git cat-file -e "$BASE_SHA^{commit}"
+          git read-tree "$BASE_SHA^{tree}"
 
-          # Use the downloaded Artifact as the worktree for the dist/ path only.
-          # Other files remain represented by the fetched commit tree in the index.
+          # No PR files enter the target tree; only the downloaded dist/ bytes
+          # change, and the Ref name still comes from Artifact dist-meta/head-ref.
           GIT_WORK_TREE="$incoming" git add -A -f -- dist/
           tree_sha="$(git write-tree)"
           new_commit="$(printf '%s\n' 'GHSL lab: apply rebuilt dist artifact' | \
             git -c user.name='github-actions[bot]' \
                 -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-                commit-tree "$tree_sha" -p "$PR_HEAD_SHA")"
+                commit-tree "$tree_sha" -p "$BASE_SHA")"
 
-          # The pushed source commit is derived from Artifact head-sha; the
-          # destination Ref is derived from Artifact head-ref. No force push.
+          # The source tree comes from the trusted Base commit and Artifact
+          # dist/; the destination Ref is derived from Artifact head-ref.
+          # The PR Head SHA was checked and fetched for source identity. No force push.
           HEAD_SHA="$new_commit"
           cat > "$RUNNER_TEMP/ghsl-askpass.sh" <<'ASKPASS'
           #!/bin/sh
@@ -347,6 +353,7 @@ jobs:
           echo "producer_run_id=${{ github.event.workflow_run.id }}"
           echo "pull_request_number=$PR_NUMBER"
           echo "artifact_head_sha=$PR_HEAD_SHA"
+          echo "consumer_base_sha=$BASE_SHA"
           echo "consumer_commit_sha=$HEAD_SHA"
           echo "written_ref=refs/heads/$HEAD_REF"
           echo "verified_remote_ref_sha=$remote_sha"
